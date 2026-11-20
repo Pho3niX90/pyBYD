@@ -70,6 +70,7 @@ FEATURE_REGISTRY: tuple[FeatureSpec, ...] = (
     FeatureSpec("energy_analysis", "Energy analysis", ("1022",), "sensor"),
     FeatureSpec("tpms", "Tire pressure monitoring (TPMS)", ("1004",), "sensor"),
     FeatureSpec("direct_tpms", "Direct tire pressure", ("10040001",), "sensor"),
+    FeatureSpec("sentry", "Sentry mode", ("1024",), "sensor"),
     FeatureSpec("vehicle_health", "Vehicle health summary", ("1023",), "sensor"),
     FeatureSpec("health_tpms", "Health: tire pressure system", ("10230001",), "sensor"),
     FeatureSpec("health_steering", "Health: steering system", ("10230002",), "sensor"),
@@ -241,6 +242,7 @@ class VehicleCapabilities(BydBaseModel):
     energy_analysis: bool | None = None
     tpms: bool | None = None
     direct_tpms: bool | None = None
+    sentry: bool | None = None
     vehicle_health: bool | None = None
     health_tpms: bool | None = None
     health_steering: bool | None = None

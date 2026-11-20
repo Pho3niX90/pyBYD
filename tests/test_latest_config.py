@@ -165,9 +165,9 @@ def test_supported_summary_pins_count() -> None:
     assert total == len(FEATURE_REGISTRY)
     # the test vehicle supports every registry feature except battery_heat,
     # the four ATTO 3 EVO additions (nfc_key, uwb_key, mobile_ota, scheduled_departure),
-    # rear seat ventilation (left and right), tpms (1004), and three DTC sensors
+    # rear seat ventilation (left and right), tpms (1004), sentry (1024), and three DTC sensors
     # (10230006, 10230008, 10230009).
-    assert supported == total - 10, f"the test vehicle fixture supported={supported}/{total} (expected total-10)"
+    assert supported == total - 11, f"the test vehicle fixture supported={supported}/{total} (expected total-11)"
 
 
 def test_feature_report_returns_one_row_per_registry_entry() -> None:
@@ -253,3 +253,15 @@ def test_atto3_evo_function_nos_map_battery_heat_and_leave_no_unknowns() -> None
     assert caps.uwb_key is True
     assert caps.mobile_ota is True
     assert caps.scheduled_departure is True
+
+
+def test_sentry_capability_tracks_1024_function_no() -> None:
+    """sentry is True when 1024 is present and False when omitted."""
+    without_sentry = VehicleCapabilities.from_latest_config("VIN_PLACEHOLDER", _build_latest(["1005"]))
+    with_sentry = VehicleCapabilities.from_latest_config("VIN_PLACEHOLDER", _build_latest(["1005", "1024"]))
+
+    assert without_sentry.sentry is False
+    assert with_sentry.sentry is True
+    assert with_sentry.unknown_function_nos == []
+
+
