@@ -29,9 +29,11 @@ from pybyd.models.message_center import (
     VehicleMsgItemInfo,
     VehicleMsgListResponse,
 )
+from pybyd.models.ota import OtaStatus, OtaUpgradeInfo, OtaUpgradeResult
 from pybyd.models.push_notification import PushNotificationState
 from pybyd.models.realtime import (
     AirCirculationMode,
+    AirRunState,
     ChargingState,
     ConnectState,
     DoorOpenState,
@@ -56,11 +58,12 @@ from pybyd.models.standby import (
     StandbySchedule,
 )
 from pybyd.models.token import AuthToken
-from pybyd.models.vehicle import EmpowerRange, EnergyType, Vehicle
+from pybyd.models.vehicle import EmpowerDetail, EmpowerRange, EnergyType, Vehicle
 
 __all__ = [
     "AcCurrentLimit",
     "AirCirculationMode",
+    "AirRunState",
     "AuthToken",
     "BatteryHeatParams",
     "BydBaseModel",
@@ -89,6 +92,7 @@ __all__ = [
     "ConnectState",
     "ControlState",
     "DoorOpenState",
+    "EmpowerDetail",
     "EmpowerRange",
     "EnergyConsumption",
     "EnergyType",
@@ -97,6 +101,9 @@ __all__ = [
     "LatestConfigFunction",
     "LockState",
     "OnlineState",
+    "OtaStatus",
+    "OtaUpgradeInfo",
+    "OtaUpgradeResult",
     "PowerGear",
     "PushNotificationState",
     "RemoteCommand",

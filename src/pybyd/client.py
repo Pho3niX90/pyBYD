@@ -22,13 +22,15 @@ from pybyd._api import gps as _gps_api
 from pybyd._api import hvac as _hvac_api
 from pybyd._api import latest_config as _latest_config_api
 from pybyd._api import message_center as _message_center_api
+from pybyd._api import ota as _ota_api
 from pybyd._api import push_notifications as _push_api
 from pybyd._api import realtime as _realtime_api
 from pybyd._api import smart_charging as _smart_api
 from pybyd._api import standby as _standby_api
 from pybyd._api import vehicle as _vehicle_api
 from pybyd._api import vehicle_settings as _settings_api
-from pybyd._api.login import build_login_request, parse_login_response
+from pybyd._api.login import build_login_request, parse_login_response, refresh_session_token
+from pybyd._constants import COMMAND_POLL_DELAYS_S, resolve_poll_delays
 from pybyd._crypto.bangcle import BangcleCodec
 from pybyd._crypto.hashing import md5_hex
 from pybyd._mqtt import (
@@ -47,12 +49,15 @@ from pybyd.exceptions import (
     BydEndpointNotSupportedError,
     BydError,
     BydRemoteControlError,
+    BydServerTimeError,
+    BydServiceBusyError,
     BydSessionExpiredError,
+    BydTokenRefreshError,
 )
 from pybyd.models._base import BydBaseModel
 from pybyd.models.booking import BookingList
 from pybyd.models.charging import ChargingStatus
-from pybyd.models.command_gating import evaluate_command_gate
+from pybyd.models.command_gating import GUEST_PERMISSION_GPS, evaluate_command_gate
 from pybyd.models.control import (
     BatteryHeatParams,
     ChargeChangeResult,
@@ -74,6 +79,7 @@ from pybyd.models.gps import GpsInfo
 from pybyd.models.hvac import HvacStatus
 from pybyd.models.latest_config import VehicleCapabilities, VehicleLatestConfig
 from pybyd.models.message_center import NotificationCategory, VehicleMsgItemInfo
+from pybyd.models.ota import OtaUpgradeInfo
 from pybyd.models.push_notification import PushNotificationState
 from pybyd.models.realtime import VehicleRealtimeData
 from pybyd.models.smart_charging import AcCurrentLimit, SmartChargingSchedule
@@ -86,7 +92,7 @@ from pybyd.models.standby import (
     StandbyPlanRunResult,
     StandbySchedule,
 )
-from pybyd.models.vehicle import EnergyType, Vehicle
+from pybyd.models.vehicle import EmpowerDetail, EnergyType, Vehicle
 from pybyd.session import Session
 
 if TYPE_CHECKING:
@@ -113,7 +119,7 @@ class _MqttWaiter:
     """
 
     vin: str
-    future: asyncio.Future[dict[str, Any]]
+    future: asyncio.Future[dict[str, Any] | None]
     event_type: str | None = None
     serial: str | None = None
     created_at: float = field(default_factory=time.monotonic)
@@ -170,6 +176,9 @@ class BydClient:
         # CONNACK-refusal recovery state (see _on_mqtt_connack_refused).
         self._mqtt_recovery_attempts: int = 0
         self._mqtt_recovery_last_at: float = 0.0
+        # Rate-limit state for MEA 1008 dead-session probe / recovery.
+        self._busy_probe_last_at: float | None = None
+        self._busy_reauth_last_at: float | None = None
         self._on_vehicle_info = on_vehicle_info
         self._on_mqtt_event_cb = on_mqtt_event
         self._on_command_ack_cb = on_command_ack
@@ -249,15 +258,23 @@ class BydClient:
     async def login(self) -> None:
         """Authenticate against the BYD API and obtain session tokens."""
         transport = self._require_transport()
-        outer = build_login_request(self._config, _now_ms())
-        response = await transport.post_secure("/app/account/login", outer)
-        token = parse_login_response(response, self._config.password)
+        for attempt in range(2):
+            offset_ms = int(getattr(transport, "server_time_offset_ms", 0) or 0)
+            outer = build_login_request(self._config, _now_ms() + offset_ms)
+            response = await transport.post_secure("/app/account/login", outer)
+            try:
+                token = parse_login_response(response, self._config.password)
+                break
+            except BydServerTimeError:
+                if attempt == 1:
+                    raise
 
         ttl = self._config.session_ttl if self._config.session_ttl > 0 else float("inf")
         self._session = Session(
             user_id=token.user_id,
             sign_token=token.sign_token,
             encry_token=token.encry_token,
+            refresh_token=token.refresh_token,
             ttl=ttl,
         )
         # What we know about each car's userType outlives the login.
@@ -425,19 +442,163 @@ class BydClient:
             }
         )
 
-    async def _call_with_reauth(self, fn: Callable[[], Awaitable[T]]) -> T:
-        """Run an API call, retrying once on session expiry."""
+    # MEA single-session enforcement (issue #104): vehicle endpoints answer
+    # code=1008 for invalidated sessions while account endpoints still report
+    # session expiry. On read-only vehicle calls, probe getAllListByUserId to
+    # distinguish a dead session from genuine backend busyness, rate-limited so
+    # busy bursts don't spam probes and an active phone-app session doesn't
+    # trigger a login ping-pong loop.
+    _BUSY_PROBE_COOLDOWN_S: float = 60.0
+    _BUSY_REAUTH_COOLDOWN_S: float = 600.0
+
+    async def _refresh_or_relogin(self) -> None:
+        """Refresh tokens via ``/app/token/refresh`` when available, else re-login."""
+        session = self._session
+        transport = self._transport
+        if session is not None and transport is not None and session.refresh_token:
+            try:
+                refreshed = await refresh_session_token(self._config, session, transport)
+                self._session = session.with_refreshed_tokens(
+                    sign_token=refreshed.sign_token,
+                    encry_token=refreshed.encry_token,
+                    refresh_token=refreshed.refresh_token,
+                )
+                if self._mqtt_runtime is not None:
+                    self._mqtt_runtime.update_decrypt_key(self._session.content_key())
+                return
+            except BydError:
+                _logger.debug("Token refresh failed; falling back to full re-login", exc_info=True)
+        self.invalidate_session()
+        await self.ensure_session()
+
+    async def _recover_busy_session(self, exc: BydServiceBusyError) -> bool:
+        """Probe whether a ``1008`` busy error actually indicates an invalidated session.
+
+        Returns ``True`` when the lightweight account probe confirms the
+        session is expired/refreshable and recovery succeeded so the caller can
+        retry once; returns ``False`` in all other cases so the original
+        :class:`BydServiceBusyError` is surfaced unchanged.
+        """
+        if exc.code != "1008":
+            return False
+
+        session = self._session
+        transport = self._transport
+        if session is None or transport is None:
+            return False
+
+        now = time.monotonic()
+        if self._busy_reauth_last_at is not None and now - self._busy_reauth_last_at < self._BUSY_REAUTH_COOLDOWN_S:
+            _logger.debug(
+                "Skipping 1008 session probe for %s (re-auth cooldown active)",
+                exc.endpoint,
+            )
+            return False
+        if self._busy_probe_last_at is not None and now - self._busy_probe_last_at < self._BUSY_PROBE_COOLDOWN_S:
+            _logger.debug(
+                "Skipping 1008 session probe for %s (probe cooldown active)",
+                exc.endpoint,
+            )
+            return False
+
+        self._busy_probe_last_at = now
+        try:
+            await _vehicle_api.fetch_vehicle_list(self._config, session, transport)
+        except BydTokenRefreshError as probe_exc:
+            if self._session is not session and self._session is not None and not self._session.is_expired:
+                _logger.debug("Session refreshed concurrently during 1008 probe; retrying %s", exc.endpoint)
+                return True
+            self._busy_reauth_last_at = time.monotonic()
+            _logger.info(
+                "1008 on %s reflects refreshable session (probe code=%s); refreshing session",
+                exc.endpoint,
+                probe_exc.code,
+            )
+            try:
+                await self._refresh_or_relogin()
+            except Exception:
+                _logger.debug("Session refresh after 1008 probe failed", exc_info=True)
+                return False
+            return True
+        except BydSessionExpiredError as probe_exc:
+            if self._session is not session and self._session is not None and not self._session.is_expired:
+                _logger.debug("Session re-authenticated concurrently during 1008 probe; retrying %s", exc.endpoint)
+                return True
+            self._busy_reauth_last_at = time.monotonic()
+            _logger.info(
+                "1008 on %s reflects invalidated session (probe code=%s); re-authenticating",
+                exc.endpoint,
+                probe_exc.code,
+            )
+            try:
+                self.invalidate_session()
+                await self.ensure_session()
+            except Exception:
+                _logger.debug("Re-authentication after 1008 probe failed", exc_info=True)
+                return False
+            return True
+        except Exception as probe_exc:
+            _logger.debug(
+                "1008 session probe for %s failed (%s); keeping original BydServiceBusyError",
+                exc.endpoint,
+                type(probe_exc).__name__,
+                exc_info=True,
+            )
+            return False
+
+        _logger.debug(
+            "1008 session probe for %s succeeded — session is valid; keeping original BydServiceBusyError",
+            exc.endpoint,
+        )
+        return False
+
+    async def _call_with_reauth(
+        self,
+        fn: Callable[[], Awaitable[T]],
+        *,
+        probe_busy_session: bool = False,
+        retry_if: Callable[[], bool] | None = None,
+    ) -> T:
+        """Run an API call, retrying once on session expiry, token refresh, or clock drift.
+
+        ``retry_if`` lets callers veto every retry path: commands with physical
+        side effects pass a predicate that returns ``False`` once their
+        trigger has been dispatched, so a session expiry, token refresh or
+        clock-drift error mid-poll cannot re-send the command.
+
+        When *probe_busy_session* is ``True`` (read-only vehicle endpoints only),
+        a ``BydServiceBusyError`` (code ``1008``) triggers a rate-limited probe
+        against ``/app/account/getAllListByUserId`` to distinguish genuine cloud
+        busyness from an invalidated session.
+        """
         try:
             return await fn()
+        except BydTokenRefreshError:
+            if retry_if is not None and not retry_if():
+                raise
+            await self._refresh_or_relogin()
+            return await fn()
+        except BydServerTimeError:
+            if retry_if is not None and not retry_if():
+                raise
+            # SecureTransport updates server_time_offset_ms from the HTTP Date header.
+            return await fn()
         except BydSessionExpiredError:
+            if retry_if is not None and not retry_if():
+                raise
             self.invalidate_session()
             await self.ensure_session()
             return await fn()
+        except BydServiceBusyError as exc:
+            if probe_busy_session and await self._recover_busy_session(exc):
+                return await fn()
+            raise
 
     async def _authed_call(
         self,
         fn: Callable[..., Awaitable[T]],
         *args: Any,
+        probe_busy_session: bool = False,
         **kwargs: Any,
     ) -> T:
         """Run *fn(config, session, transport, \\*args, \\*\\*kwargs)* with auto re-auth.
@@ -452,7 +613,7 @@ class BydClient:
             transport = self._require_transport()
             return await fn(self._config, session, transport, *args, **kwargs)
 
-        return await self._call_with_reauth(_call)
+        return await self._call_with_reauth(_call, probe_busy_session=probe_busy_session)
 
     # ------------------------------------------------------------------
     # MQTT
@@ -494,10 +655,13 @@ class BydClient:
         self._mqtt_runtime = None
         if runtime is not None:
             runtime.stop()
-        # Cancel any pending MQTT waiters so callers don't hang
+        # End pending MQTT waits as if they timed out, so callers don't hang
+        # and fall back to HTTP polling. Cancelling the futures instead would
+        # raise CancelledError out of a read in progress whenever MQTT
+        # restarts under it (a decrypt-failure re-login, for one).
         for w in self._mqtt_waiters:
             if not w.future.done():
-                w.future.cancel()
+                w.future.set_result(None)
         self._mqtt_waiters.clear()
 
     _MQTT_REAUTH_COOLDOWN_S: float = 60.0
@@ -904,7 +1068,7 @@ class BydClient:
         if runtime is None or not runtime.is_running or effective_timeout <= 0:
             return None
         loop = self._loop or asyncio.get_running_loop()
-        fut: asyncio.Future[dict[str, Any]] = loop.create_future()
+        fut: asyncio.Future[dict[str, Any] | None] = loop.create_future()
         waiter = _MqttWaiter(vin=vin, event_type=event_type, serial=serial, future=fut)
         self._mqtt_waiters.append(waiter)
         try:
@@ -932,9 +1096,11 @@ class BydClient:
         mqtt_event_type: str | None = None,
         mqtt_timeout: float | None = None,
         poll_attempts: int = 10,
-        poll_interval: float = 1.5,
+        poll_interval: float | None = 1.5,
+        poll_ladder: tuple[float, ...] = COMMAND_POLL_DELAYS_S,
         signal_retries: int = 2,
         validate_context: dict[str, Any] | None = None,
+        on_trigger_dispatched: Callable[[], None] | None = None,
     ) -> _M:
         """Generic trigger → MQTT wait → HTTP poll fallback.
 
@@ -964,6 +1130,11 @@ class BydClient:
             transport,
             vin,
         )
+        if on_trigger_dispatched is not None:
+            try:
+                on_trigger_dispatched()
+            except Exception:
+                _logger.debug("on_trigger_dispatched callback failed", exc_info=True)
         merged_latest = trigger_info if isinstance(trigger_info, dict) else {}
 
         if isinstance(trigger_info, dict) and is_ready(trigger_info):
@@ -1005,9 +1176,10 @@ class BydClient:
             # Phase 3: HTTP poll fallback
             _logger.debug("MQTT timeout; falling back to HTTP polling for %s vin=%s", label, vin)
             consecutive_unavailable = 0
-            for attempt in range(1, poll_attempts + 1):
-                if poll_interval > 0:
-                    await asyncio.sleep(poll_interval)
+            delays = resolve_poll_delays(poll_attempts, poll_interval, default_ladder=poll_ladder)
+            for attempt, delay in enumerate(delays, start=1):
+                if delay > 0:
+                    await asyncio.sleep(delay)
                 try:
                     latest, serial = await fetch_fn(
                         poll_endpoint,
@@ -1099,6 +1271,36 @@ class BydClient:
             return None
         return dict(cached.vehicle_fun_learn_info) or None
 
+    def _guest_permissions_for(self, vin: str) -> tuple[bool, frozenset[str] | None]:
+        """Return ``(is_shared, granted_permission_codes)`` from cached vehicle metadata."""
+        cached = self._vehicle_metadata_by_vin.get(vin)
+        if cached is None or not cached.is_shared:
+            return False, None
+        return True, cached.granted_permission_codes
+
+    async def get_empower_detail(self, vin: str, *, empower_id: int | None = None) -> EmpowerDetail:
+        """Fetch granular guest authorization details for a shared vehicle."""
+        resolved_id = empower_id
+        if resolved_id is None:
+            cached = self._vehicle_metadata_by_vin.get(vin)
+            if cached is None:
+                await self.get_vehicles()
+                cached = self._vehicle_metadata_by_vin.get(vin)
+            if cached is not None:
+                resolved_id = cached.empower_id
+        if resolved_id is None:
+            raise BydEndpointNotSupportedError(
+                f"get_empower_detail requires empower_id (VIN {vin} is not a shared guest grant)",
+                code="not_shared_vehicle",
+                endpoint="/vehicle/empower/query/empowerDetailByVin",
+            )
+        return await self._authed_call(
+            _vehicle_api.fetch_empower_detail_by_vin,
+            vin,
+            probe_busy_session=True,
+            empower_id=resolved_id,
+        )
+
     async def get_car(
         self,
         vin: str,
@@ -1164,7 +1366,7 @@ class BydClient:
 
     async def get_latest_configs(self, vins: list[str]) -> dict[str, VehicleLatestConfig]:
         """Fetch raw latest-config payload for one or more VINs."""
-        return await self._authed_call(_latest_config_api.fetch_latest_config, vins)
+        return await self._authed_call(_latest_config_api.fetch_latest_config, vins, probe_busy_session=True)
 
     async def get_latest_config(self, vin: str) -> VehicleLatestConfig:
         """Fetch raw latest-config payload for a single VIN."""
@@ -1239,7 +1441,7 @@ class BydClient:
                 validate_context={"energy_type": energy_type},
             )
 
-        return await self._call_with_reauth(_call)
+        return await self._call_with_reauth(_call, probe_busy_session=True)
 
     async def get_gps_info(
         self,
@@ -1256,6 +1458,13 @@ class BydClient:
         the ``requestSerial``.  Falls back to HTTP polling of
         ``getGpsInfoResult`` if MQTT doesn't deliver in time.
         """
+        cached = self._vehicle_metadata_by_vin.get(vin)
+        if cached is not None and cached.is_shared and not cached.has_permission(GUEST_PERMISSION_GPS):
+            raise BydEndpointNotSupportedError(
+                f"get_gps_info blocked for shared VIN {vin}: guest permission {GUEST_PERMISSION_GPS!r} not granted",
+                code="guest_permission_denied",
+                endpoint="/control/getGpsInfo",
+            )
 
         async def _call() -> GpsInfo:
             return await self._trigger_and_poll(
@@ -1272,15 +1481,15 @@ class BydClient:
                 signal_retries=signal_retries,
             )
 
-        return await self._call_with_reauth(_call)
+        return await self._call_with_reauth(_call, probe_busy_session=True)
 
     async def get_hvac_status(self, vin: str) -> HvacStatus:
         """Fetch HVAC / climate status."""
-        return await self._authed_call(_hvac_api.fetch_hvac_status, vin)
+        return await self._authed_call(_hvac_api.fetch_hvac_status, vin, probe_busy_session=True)
 
     async def get_charging_status(self, vin: str) -> ChargingStatus:
         """Fetch charging status."""
-        return await self._authed_call(_charging_api.fetch_charging_status, vin)
+        return await self._authed_call(_charging_api.fetch_charging_status, vin, probe_busy_session=True)
 
     async def get_charging_schedule(self, vin: str) -> SmartChargingSchedule:
         """Fetch the configured smart-charging schedule.
@@ -1289,7 +1498,7 @@ class BydClient:
         ``smartChargeDto`` / ``smartJourneyDto`` blocks into a
         :class:`SmartChargingSchedule`.
         """
-        return await self._authed_call(_smart_api.fetch_charging_schedule, vin)
+        return await self._authed_call(_smart_api.fetch_charging_schedule, vin, probe_busy_session=True)
 
     async def get_charging_homepage(
         self,
@@ -1306,7 +1515,7 @@ class BydClient:
         — this combined call exists alongside, not in place of, the
         push path.
         """
-        raw = await self._authed_call(_charging_api.fetch_charging_homepage, vin)
+        raw = await self._authed_call(_charging_api.fetch_charging_homepage, vin, probe_busy_session=True)
         status = ChargingStatus.model_validate(raw)
         schedule = SmartChargingSchedule.model_validate({"vin": vin, **raw})
         return status, schedule
@@ -1322,6 +1531,7 @@ class BydClient:
         return await self._authed_call(
             _smart_api.fetch_ac_current_limit,
             vin,
+            probe_busy_session=True,
             energy_type=resolved_energy_type,
         )
 
@@ -1339,13 +1549,14 @@ class BydClient:
         return await self._authed_call(
             _energy_api.fetch_energy_consumption,
             vin,
+            probe_busy_session=True,
             power_type=power_type,
             auto_model_name=auto_model_name,
         )
 
     async def get_push_state(self, vin: str) -> PushNotificationState:
         """Fetch push notification state."""
-        return await self._authed_call(_push_api.fetch_push_state, vin)
+        return await self._authed_call(_push_api.fetch_push_state, vin, probe_busy_session=True)
 
     async def set_push_state(self, vin: str, *, enable: bool, push_type: int = 701) -> CommandAck:
         """Enable/disable a per-type push notification switch.
@@ -1427,7 +1638,7 @@ class BydClient:
         control_params: Mapping[str, Any] | ControlParams | None = None,
         command_pwd: str | None = None,
         poll_attempts: int = 10,
-        poll_interval: float = 1.5,
+        poll_interval: float | None = None,
     ) -> RemoteControlResult:
         """Internal: send a remote command and poll/wait for result."""
         capabilities = await self.get_vehicle_capabilities(vin)
@@ -1446,7 +1657,15 @@ class BydClient:
                 params_dict = dict(control_params)
 
         learn_info = await self._vehicle_fun_learn_info_for(vin)
-        gate = evaluate_command_gate(command, capabilities, control_params=params_dict, learn_info=learn_info)
+        is_shared, guest_perms = self._guest_permissions_for(vin)
+        gate = evaluate_command_gate(
+            command,
+            capabilities,
+            control_params=params_dict,
+            learn_info=learn_info,
+            is_shared=is_shared,
+            guest_permissions=guest_perms,
+        )
         if not gate.supported:
             raise BydEndpointNotSupportedError(
                 (f"Remote command {command.value} blocked for VIN {vin}: gate={gate.gate_id} reason={gate.reason}"),
@@ -1464,6 +1683,14 @@ class BydClient:
             raw.setdefault("requestSerial", serial)
             return RemoteControlResult.model_validate(raw)
 
+        trigger_dispatched = False
+
+        def _on_trigger_dispatched(serial: str | None) -> None:
+            nonlocal trigger_dispatched
+            trigger_dispatched = True
+            if serial:
+                self._register_pending_command(vin, serial, command.value)
+
         async def _call() -> RemoteControlResult:
             session = await self.ensure_session()
             transport = self._require_transport()
@@ -1478,12 +1705,10 @@ class BydClient:
                 poll_attempts=poll_attempts,
                 poll_interval=poll_interval,
                 mqtt_result_waiter=_mqtt_result_waiter,
-                on_trigger_dispatched=lambda serial: (
-                    self._register_pending_command(vin, serial, command.value) if serial else None
-                ),
+                on_trigger_dispatched=_on_trigger_dispatched,
             )
 
-        return await self._call_with_reauth(_call)
+        return await self._call_with_reauth(_call, retry_if=lambda: not trigger_dispatched)
 
     async def lock(
         self,
@@ -1662,8 +1887,8 @@ class BydClient:
         charge_way: str,
         enabled: bool = True,
         mqtt_timeout: float | None = None,
-        poll_attempts: int = 6,
-        poll_interval: float = 2.0,
+        poll_attempts: int = 10,
+        poll_interval: float | None = None,
     ) -> ChargeChangeResult:
         """Save a smart-charging schedule and wait for the toggle to settle.
 
@@ -1686,13 +1911,26 @@ class BydClient:
         """
         capabilities = await self.get_vehicle_capabilities(vin)
         learn_info = await self._vehicle_fun_learn_info_for(vin)
-        gate = evaluate_command_gate(RemoteCommand.START_CHARGE, capabilities, learn_info=learn_info)
+        is_shared, guest_perms = self._guest_permissions_for(vin)
+        gate = evaluate_command_gate(
+            RemoteCommand.START_CHARGE,
+            capabilities,
+            learn_info=learn_info,
+            is_shared=is_shared,
+            guest_permissions=guest_perms,
+        )
         if not gate.supported:
             raise BydEndpointNotSupportedError(
                 (f"save_charging_schedule blocked for VIN {vin}: gate={gate.gate_id} reason={gate.reason}"),
                 code="command_gate_blocked",
                 endpoint="/control/smartCharge/saveOrUpdate",
             )
+
+        trigger_dispatched = False
+
+        def _mark_dispatched() -> None:
+            nonlocal trigger_dispatched
+            trigger_dispatched = True
 
         async def _call() -> ChargeChangeResult:
             result = await self._trigger_and_poll(
@@ -1712,6 +1950,7 @@ class BydClient:
                 mqtt_timeout=mqtt_timeout,
                 poll_attempts=poll_attempts,
                 poll_interval=poll_interval,
+                on_trigger_dispatched=_mark_dispatched,
             )
             res = result.res
             if res == 2:
@@ -1728,7 +1967,7 @@ class BydClient:
                 endpoint="/control/smartCharge/changeResult",
             )
 
-        return await self._call_with_reauth(_call)
+        return await self._call_with_reauth(_call, retry_if=lambda: not trigger_dispatched)
 
     async def toggle_smart_charging(self, vin: str, *, enable: bool) -> CommandAck:
         """Enable or disable smart charging."""
@@ -1739,8 +1978,8 @@ class BydClient:
         vin: str,
         *,
         mqtt_timeout: float | None = None,
-        poll_attempts: int = 6,
-        poll_interval: float = 2.0,
+        poll_attempts: int = 10,
+        poll_interval: float | None = None,
     ) -> ChargeChangeResult:
         """Start charging immediately and wait for the toggle to settle.
 
@@ -1761,13 +2000,26 @@ class BydClient:
         """
         capabilities = await self.get_vehicle_capabilities(vin)
         learn_info = await self._vehicle_fun_learn_info_for(vin)
-        gate = evaluate_command_gate(RemoteCommand.START_CHARGE, capabilities, learn_info=learn_info)
+        is_shared, guest_perms = self._guest_permissions_for(vin)
+        gate = evaluate_command_gate(
+            RemoteCommand.START_CHARGE,
+            capabilities,
+            learn_info=learn_info,
+            is_shared=is_shared,
+            guest_permissions=guest_perms,
+        )
         if not gate.supported:
             raise BydEndpointNotSupportedError(
                 (f"start_charging blocked for VIN {vin}: gate={gate.gate_id} reason={gate.reason}"),
                 code="command_gate_blocked",
                 endpoint="/control/smartCharge/changeChargeStatue",
             )
+
+        trigger_dispatched = False
+
+        def _mark_dispatched() -> None:
+            nonlocal trigger_dispatched
+            trigger_dispatched = True
 
         async def _call() -> ChargeChangeResult:
             result = await self._trigger_and_poll(
@@ -1782,6 +2034,7 @@ class BydClient:
                 mqtt_timeout=mqtt_timeout,
                 poll_attempts=poll_attempts,
                 poll_interval=poll_interval,
+                on_trigger_dispatched=_mark_dispatched,
             )
             res = result.res
             if res == 2:
@@ -1812,15 +2065,15 @@ class BydClient:
                 endpoint="/control/smartCharge/changeResult",
             )
 
-        return await self._call_with_reauth(_call)
+        return await self._call_with_reauth(_call, retry_if=lambda: not trigger_dispatched)
 
     async def stop_charging(
         self,
         vin: str,
         *,
         mqtt_timeout: float | None = None,
-        poll_attempts: int = 6,
-        poll_interval: float = 2.0,
+        poll_attempts: int = 10,
+        poll_interval: float | None = None,
     ) -> ChargeChangeResult:
         """Not supported: the BYD cloud has no working stop-charge command.
 
@@ -1864,11 +2117,44 @@ class BydClient:
         booking is set, so an empty ``bookings`` list means "none reported",
         not a guaranteed "none scheduled".
         """
-        return await self._authed_call(_booking_api.fetch_booking_list, vin)
+        return await self._authed_call(_booking_api.fetch_booking_list, vin, probe_busy_session=True)
+
+    async def get_ota_version(self, vin: str) -> OtaUpgradeInfo:
+        """Fetch OTA firmware version, release notes, and night auto-upgrade settings."""
+        return await self._authed_call(_ota_api.fetch_ota_version, vin, probe_busy_session=True)
+
+    async def set_ota_auto_upgrade(
+        self,
+        vin: str,
+        *,
+        enabled: bool,
+        auto_upgrade_time: str = "2:00",
+        command_pwd: str | None = None,
+    ) -> CommandAck:
+        """Enable or disable automatic night OTA upgrade and set its scheduled time.
+
+        Parameters
+        ----------
+        enabled : bool
+            Whether night automatic OTA upgrade is enabled.
+        auto_upgrade_time : str
+            Scheduled time in ``H:mm`` format (default ``"2:00"``).
+        command_pwd : str or None
+            6-digit control PIN or its 32-char MD5 hex digest; defaults to
+            ``config.control_pin``.
+        """
+        resolved_pwd = self._require_command_pwd(command_pwd)
+        return await self._authed_call(
+            _ota_api.sync_auto_upgrade,
+            vin,
+            enabled=enabled,
+            auto_upgrade_time=auto_upgrade_time,
+            command_pwd=resolved_pwd,
+        )
 
     async def get_standby_plans(self, vin: str) -> StandbyPlanList:
         """Fetch the preconditioning plans app 3.6.0 schedules climate with."""
-        return await self._authed_call(_standby_api.fetch_standby_plans, vin)
+        return await self._authed_call(_standby_api.fetch_standby_plans, vin, probe_busy_session=True)
 
     async def save_standby_plan(
         self,
@@ -1884,14 +2170,19 @@ class BydClient:
         (eg the ``OPENAIR`` ``controlParamsMap``) to change what the plan
         does.  Saving with ``default_plan=1`` makes it the default, the
         cloud clears the flag on the others.
+
+        A once run less than 20 min ahead raises
+        :class:`BydStandbyScheduleError`; a daily or weekly one is saved
+        but skips today, which only the returned list's ``message`` says.
         """
-        await self._authed_call(
+        saved = await self._authed_call(
             _standby_api.save_standby_plan,
             vin,
             plan,
             schedule if schedule is not None else plan.schedule,
         )
-        return await self.get_standby_plans(vin)
+        plans = await self.get_standby_plans(vin)
+        return plans.model_copy(update={"message": saved.get("message") or None})
 
     async def create_standby_plan(
         self,
@@ -1958,6 +2249,12 @@ class BydClient:
         since the app itself stops polling there; other values raise.
         """
 
+        trigger_dispatched = False
+
+        def _mark_dispatched() -> None:
+            nonlocal trigger_dispatched
+            trigger_dispatched = True
+
         async def _call() -> StandbyPlanRunResult:
             result = await self._trigger_and_poll(
                 vin=vin,
@@ -1970,6 +2267,7 @@ class BydClient:
                 mqtt_timeout=0,
                 poll_attempts=poll_attempts,
                 poll_interval=poll_interval,
+                on_trigger_dispatched=_mark_dispatched,
             )
             if result.res is not None and result.res not in (1, 2):
                 raise BydRemoteControlError(
@@ -1979,4 +2277,4 @@ class BydClient:
                 )
             return result.model_copy(update={"vin": vin})
 
-        return await self._call_with_reauth(_call)
+        return await self._call_with_reauth(_call, retry_if=lambda: not trigger_dispatched)

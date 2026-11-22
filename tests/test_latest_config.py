@@ -263,5 +263,3 @@ def test_sentry_capability_tracks_1024_function_no() -> None:
     assert without_sentry.sentry is False
     assert with_sentry.sentry is True
     assert with_sentry.unknown_function_nos == []
-
-
