@@ -21,6 +21,7 @@ from pybyd._api import energy as _energy_api
 from pybyd._api import gps as _gps_api
 from pybyd._api import hvac as _hvac_api
 from pybyd._api import latest_config as _latest_config_api
+from pybyd._api import maintenance as _maintenance_api
 from pybyd._api import message_center as _message_center_api
 from pybyd._api import ota as _ota_api
 from pybyd._api import push_notifications as _push_api
@@ -78,6 +79,7 @@ from pybyd.models.energy import EnergyConsumption
 from pybyd.models.gps import GpsInfo
 from pybyd.models.hvac import HvacStatus
 from pybyd.models.latest_config import VehicleCapabilities, VehicleLatestConfig
+from pybyd.models.maintenance import MaintenanceHistory
 from pybyd.models.message_center import NotificationCategory, VehicleMsgItemInfo
 from pybyd.models.ota import OtaUpgradeInfo
 from pybyd.models.push_notification import PushNotificationState
@@ -1101,6 +1103,7 @@ class BydClient:
         signal_retries: int = 2,
         validate_context: dict[str, Any] | None = None,
         on_trigger_dispatched: Callable[[], None] | None = None,
+        require_ready: bool = False,
     ) -> _M:
         """Generic trigger → MQTT wait → HTTP poll fallback.
 
@@ -1118,7 +1121,20 @@ class BydClient:
         signal_retries
             Maximum consecutive ``BydDataUnavailableError`` responses before
             giving up early (vehicle likely has no signal). Defaults to 2.
+        require_ready
+            Raise :class:`BydDataUnavailableError` instead of parsing a
+            payload that never passed *is_ready*.
         """
+
+        def _finish(raw: dict[str, Any]) -> _M:
+            if require_ready and not is_ready(raw):
+                raise BydDataUnavailableError(
+                    f"{label} returned no usable data for vin={vin}",
+                    code="not_ready",
+                    endpoint=poll_endpoint,
+                )
+            return model_cls.model_validate(raw, context=validate_context)
+
         session = await self.ensure_session()
         transport = self._require_transport()
 
@@ -1141,7 +1157,7 @@ class BydClient:
             return model_cls.model_validate(merged_latest, context=validate_context)
 
         if not serial:
-            return model_cls.model_validate(merged_latest, context=validate_context)
+            return _finish(merged_latest)
 
         # Register the serial so _on_mqtt_event can distinguish data-poll
         # responses from genuine remote-control command acks.
@@ -1171,7 +1187,7 @@ class BydClient:
                         mqtt_code,
                         vin,
                     )
-                    return model_cls.model_validate(merged_latest, context=validate_context)
+                    return _finish(merged_latest)
 
             # Phase 3: HTTP poll fallback
             _logger.debug("MQTT timeout; falling back to HTTP polling for %s vin=%s", label, vin)
@@ -1218,7 +1234,7 @@ class BydClient:
                     consecutive_unavailable = 0  # reset — different error type
                     _logger.debug("%s poll attempt=%d failed", label, attempt, exc_info=True)
 
-            return model_cls.model_validate(merged_latest, context=validate_context)
+            return _finish(merged_latest)
         finally:
             self._data_poll_serials.discard(trigger_serial)
 
@@ -1439,6 +1455,9 @@ class BydClient:
                 poll_interval=poll_interval,
                 signal_retries=signal_retries,
                 validate_context={"energy_type": energy_type},
+                # a sleeping car answers onlineState=1 with time=0 and every
+                # field zeroed; surfacing that reads as 0% SoC (pyBYD#20)
+                require_ready=True,
             )
 
         return await self._call_with_reauth(_call, probe_busy_session=True)
@@ -2151,6 +2170,10 @@ class BydClient:
             auto_upgrade_time=auto_upgrade_time,
             command_pwd=resolved_pwd,
         )
+
+    async def get_maintenance_history(self, vin: str) -> MaintenanceHistory:
+        """Fetch past workshop visits (service history)."""
+        return await self._authed_call(_maintenance_api.fetch_maintenance_history, vin, probe_busy_session=True)
 
     async def get_standby_plans(self, vin: str) -> StandbyPlanList:
         """Fetch the preconditioning plans app 3.6.0 schedules climate with."""
